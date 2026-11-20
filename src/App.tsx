@@ -30,7 +30,7 @@ const pageVariants = {
 
 type View = 'timer' | 'leaderboard' | 'stats';
 const AUTOSAVE_EVERY = 300;
-const POLL_MS = 20_000;
+const POLL_MS = 30_000;
 const HEARTBEAT_MS = 15_000;
 
 type TabItem = { id: View; icon: typeof Clock; label: string };
@@ -99,14 +99,15 @@ function TabBar({ tabs, view, onChange }: { tabs: TabItem[]; view: View; onChang
 
 export default function App() {
   const {
-    user, token, squad, leaderboard, bans, stats, sessions, isLoading, isRefreshing, error, syncError, lastSyncAt,
+    user, token, squad, leaderboard, weekBoard, bans, stats, sessions, isLoading, isRefreshing, error, syncError, lastSyncAt,
     registerByUsername, loginByUsername, createSquad, joinSquad, leaveSquad, syncTime,
-    fetchLeaderboard, fetchStats, fetchSessions, deleteSession, fetchBans, banMember, unbanMember, signOut
+    fetchLeaderboard, fetchWeekLeaderboard, fetchStats, fetchSessions, deleteSession, fetchBans, banMember, unbanMember, signOut
   } = useStore();
 
   useLiquidGlass();
 
   const [view, setView] = useState<View>('timer');
+  const [squadTab, setSquadTab] = useState<'focus' | 'time'>('focus');
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
   const [username, setUsername] = useState('');
   const [displayName, setDisplayName] = useState('');
@@ -204,7 +205,7 @@ export default function App() {
     if (!user) return;
     const tick = () => {
       if (document.visibilityState !== 'visible') return;
-      if (view === 'leaderboard') { fetchLeaderboard(); if (isAdmin) fetchBans(); }
+      if (view === 'leaderboard') { fetchLeaderboard(); fetchWeekLeaderboard(); if (isAdmin) fetchBans(); }
       if (view === 'stats') { fetchStats(); fetchSessions(); }
     };
     tick();
@@ -212,7 +213,7 @@ export default function App() {
     const onVis = () => { if (document.visibilityState === 'visible') tick(); };
     document.addEventListener('visibilitychange', onVis);
     return () => { clearInterval(id); document.removeEventListener('visibilitychange', onVis); };
-  }, [view, user?.id, user?.squad_id, isAdmin]);
+  }, [view, user?.id, user?.squad_id, isAdmin, fetchLeaderboard, fetchWeekLeaderboard, fetchBans, fetchStats, fetchSessions]);
 
   // Уход со страницы: таймер не останавливаем, накопленное кладём в очередь
   // и пробуем дослать keepalive-запросом (с токеном и ключом сессии).
@@ -278,6 +279,16 @@ export default function App() {
   }, [leaderboard, peers, now, unsynced, isRunning, user?.id]);
 
   const focusingCount = liveBoard.filter(r => r.live).length;
+
+  // Суммарное время сквада: серверные данные + мои ещё не подтверждённые секунды
+  const squadToday = useMemo(
+    () => weekBoard.reduce((a, e) => a + e.today_seconds, 0) + unsynced,
+    [weekBoard, unsynced],
+  );
+  const squadWeek = useMemo(
+    () => weekBoard.reduce((a, e) => a + e.week_seconds, 0) + unsynced,
+    [weekBoard, unsynced],
+  );
 
   // --- ЭКРАН ВХОДА / РЕГИСТРАЦИИ ---
   if (!user || !token) {
@@ -488,16 +499,105 @@ export default function App() {
             <motion.div key="leaderboard" variants={pageVariants} initial="initial" animate="animate" exit="exit" className="w-full py-4">
               <h2 className="text-lg font-semibold mb-1 px-1 flex items-center gap-2"><Trophy size={20} className="text-amber-300 shrink-0" /> <span className="truncate">Сквад: {squad.name}</span></h2>
               <p className="text-xs text-white/45 px-1 mb-4">
-                Время учёбы за сегодня
-                {lastSyncAt && ` · обновлено ${new Date(lastSyncAt).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}`}
+                {lastSyncAt ? `обновлено ${new Date(lastSyncAt).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}` : 'Загружаем…'}
               </p>
+
+              {/* Общее время сквада */}
+              <div className="glass rounded-3xl p-4 mb-3 flex items-stretch gap-3">
+                <div className="flex-1 text-center min-w-0">
+                  <p className="text-[11px] text-white/45 mb-1">Сквад сегодня</p>
+                  <p className="text-base font-semibold tabular-nums">{fmtShort(squadToday)}</p>
+                </div>
+                <div className="w-px bg-white/10 shrink-0" />
+                <div className="flex-1 text-center min-w-0">
+                  <p className="text-[11px] text-white/45 mb-1">Сквад за 7 дней</p>
+                  <p className="text-base font-semibold tabular-nums text-[#a9b8ff]">{fmtShort(squadWeek)}</p>
+                </div>
+              </div>
+
+              {/* Переключатель рейтингов */}
+              <div className="glass-inset rounded-full p-1 flex mb-4">
+                {([['focus', 'Регулярность'], ['time', 'Время сегодня']] as const).map(([id, label]) => (
+                  <button key={id} onClick={() => setSquadTab(id)}
+                    className={clsx("flex-1 py-2 rounded-full text-sm font-medium transition-colors", squadTab === id ? 'glass-raised text-white' : 'text-white/45 hover:text-white/70')}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+
               {isAdmin && (
                 <p className="msg-note mb-4 flex items-center gap-2">
                   <Crown size={14} className="shrink-0" /> Ты админ сквада: нажми «Бан» рядом с участником, чтобы исключить его. Разбанить можно внизу.
                 </p>
               )}
               {error && <p className="msg-error mb-3">{error}</p>}
-              {leaderboard.length === 0 ? (
+
+              {squadTab === 'focus' ? (
+                <>
+                  <p className="text-[11px] text-white/40 px-1 mb-3 leading-snug">
+                    Коэффициент успеваемости (0–100) за последние 7 дней: важнее заниматься понемногу каждый день, чем один раз много. День засчитывается от 20 минут.
+                  </p>
+                  {weekBoard.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center py-12 text-white/40">
+                      <Users size={48} className="mb-4 opacity-30" />
+                      <p className="text-sm">{isRefreshing ? 'Загружаем участников…' : 'Пока нет данных за неделю'}</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {weekBoard.map((entry, i) => {
+                        const mine = entry.id === user.id;
+                        const score = Math.max(0, Math.min(100, entry.focus_score));
+                        return (
+                          <motion.div layout key={entry.id} initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: Math.min(i * 0.05, 0.3) }} className={clsx("glass-row p-4", mine && 'glass-row-me')}>
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="flex items-center gap-3 min-w-0">
+                                <span className={clsx("text-sm w-5 shrink-0 tabular-nums", i < 3 ? 'text-amber-300 font-bold' : 'text-white/30')}>{i + 1}</span>
+                                <div className={twMerge("w-9 h-9 rounded-full flex items-center justify-center text-xs font-bold text-stone-800 ring-1 ring-white/40 shrink-0", entry.avatar_color)}>{entry.name.charAt(0)}</div>
+                                <div className="min-w-0">
+                                  <span className="font-medium text-sm truncate flex items-center gap-1">
+                                    {entry.name}
+                                    {entry.id === squad.created_by && <Crown size={12} className="text-amber-300 shrink-0" />}
+                                  </span>
+                                  <span className="block text-[10px] text-white/40 tabular-nums truncate">
+                                    {fmtShort(entry.week_seconds)} · ср. сессия {entry.sessions_count > 0 ? fmtShort(Math.round(entry.week_seconds / entry.sessions_count)) : '—'}
+                                  </span>
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-2 shrink-0">
+                                <div className="text-right">
+                                  <span className={clsx("text-lg font-bold tabular-nums block leading-none", score >= 70 ? 'text-emerald-200' : score >= 35 ? 'text-amber-200' : 'text-white/60')}>{Math.round(score)}</span>
+                                  <span className="text-[9px] text-white/35 uppercase tracking-wide">КУ</span>
+                                </div>
+                                {isAdmin && !mine && (
+                                  <button
+                                    onClick={() => { if (window.confirm(`Забанить ${entry.name} в скваде?`)) banMember(entry.id); }}
+                                    className="btn-danger flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-lg"
+                                  >
+                                    <Ban size={14} /> Бан
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                            {/* Неделя: точки активных дней + прогресс КУ */}
+                            <div className="mt-3 flex items-center gap-3">
+                              <div className="flex gap-1.5 shrink-0" title={`${entry.active_days} из 7 дней`}>
+                                {Array.from({ length: 7 }).map((_, di) => (
+                                  <span key={di} className={clsx("w-2 h-2 rounded-full transition-colors", di < entry.active_days ? 'bg-emerald-300 shadow-[0_0_6px_rgba(110,220,170,0.7)]' : 'bg-white/10')} />
+                                ))}
+                              </div>
+                              <div className="flex-1 h-1.5 rounded-full bg-white/10 overflow-hidden">
+                                <motion.div initial={{ width: 0 }} animate={{ width: `${score}%` }} transition={{ duration: 0.6, ease: 'easeOut' }}
+                                  className={clsx("h-full rounded-full", score >= 70 ? 'bg-emerald-300/80' : score >= 35 ? 'bg-amber-300/70' : 'bg-white/25')} />
+                              </div>
+                              <span className="text-[10px] text-white/40 tabular-nums shrink-0">{entry.active_days}/7 дн.</span>
+                            </div>
+                          </motion.div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </>
+              ) : leaderboard.length === 0 ? (
                 <div className="flex flex-col items-center justify-center py-12 text-white/40">
                   <Users size={48} className="mb-4 opacity-30" />
                   <p className="text-sm">{isRefreshing ? 'Загружаем участников…' : 'В скваде пока никого нет'}</p>
@@ -568,13 +668,13 @@ export default function App() {
               <h2 className="text-lg font-semibold mb-1 px-1 flex items-center gap-2"><BarChart3 size={20} className="text-[#a9b8ff] shrink-0" /> Моя статистика</h2>
               <p className="text-xs text-white/45 px-1 mb-4">Не зависит от сквада: сохраняется, даже если ты выйдешь или сменишь сквад</p>
               <div className="glass rounded-3xl p-6 mb-3 text-center">
-                <p className="text-sm text-white/50 mb-2">За всё время</p>
-                <p className="digits digits-live stats-digits">{fmt((stats?.total_seconds ?? 0) + unsynced)}</p>
+                <p className="text-sm text-white/50 mb-2">Сегодня</p>
+                <p className="digits digits-live stats-digits">{fmt((stats?.today_seconds ?? 0) + unsynced)}</p>
                 {isRunning && <p className="text-[11px] text-emerald-200/80 mt-2">+ текущая сессия в реальном времени</p>}
               </div>
               <div className="grid grid-cols-3 gap-2 sm:gap-3">
                 {[
-                  { label: 'Сегодня', value: fmtShort((stats?.today_seconds ?? 0) + unsynced) },
+                  { label: 'За всё время', value: fmtShort((stats?.total_seconds ?? 0) + unsynced) },
                   { label: '7 дней', value: fmtShort((stats?.week_seconds ?? 0) + unsynced) },
                   { label: 'Сессий', value: String(stats?.sessions_count ?? 0) },
                 ].map(c => (

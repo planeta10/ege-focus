@@ -3,9 +3,9 @@ import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
 
 export default defineConfig({
-server: {
-    allowedHosts: true
-  },
+  base: '/ege-focus/',
+  
+  // Объединяем все плагины в один массив
   plugins: [
     react(),
     VitePWA({
@@ -17,8 +17,12 @@ server: {
         theme_color: '#fafaf9',
         background_color: '#fafaf9',
         display: 'standalone',
-        icons: [{ src: '/vite.svg', sizes: '192x192', type: 'image/svg+xml' }] // Замени на png позже
+        icons: [{ src: '/vite.svg', sizes: '192x192', type: 'image/svg+xml' }] 
       }
     })
   ],
+
+  server: {
+    allowedHosts: true
+  },
 });

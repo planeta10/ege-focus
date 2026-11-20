@@ -8,7 +8,7 @@ export const isSupabaseConfigured = Boolean(SUPABASE_URL && SUPABASE_KEY);
 
 /** Читающие запросы обрываем быстро (15 с) и пробуем снова на новом соединении,
  *  записи (сохранение времени) ждём дольше (30 с), но тоже с повторами. */
-export const READ_TIMEOUT_MS = 15_000;
+export const READ_TIMEOUT_MS = 30_000;
 export const WRITE_TIMEOUT_MS = 30_000;
 export const REQUEST_TIMEOUT_MS = WRITE_TIMEOUT_MS;
 

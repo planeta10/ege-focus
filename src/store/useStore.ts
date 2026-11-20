@@ -5,6 +5,10 @@ import { supabase, friendlyNetworkError, withTimeout, retryResult } from '../lib
 interface Profile { id: string; username: string; name: string; avatar_color: string; squad_id: string | null; }
 interface Squad { id: string; name: string; invite_code: string; created_by: string; }
 interface LeaderboardEntry extends Profile { total_seconds: number; }
+export interface WeekLeaderboardEntry extends Profile {
+  week_seconds: number; today_seconds: number;
+  active_days: number; sessions_count: number; focus_score: number;
+}
 interface BannedUser { id: string; name: string; username: string; avatar_color: string; }
 interface UserStats { total_seconds: number; today_seconds: number; week_seconds: number; sessions_count: number; }
 interface SessionRow { id: string; duration_seconds: number; created_at: string; }
@@ -14,6 +18,7 @@ interface StoreState {
   token: string | null;              // токен входа — выдаётся сервером после пароля
   squad: Squad | null;
   leaderboard: LeaderboardEntry[];
+  weekBoard: WeekLeaderboardEntry[];
   bans: BannedUser[];
   stats: UserStats | null;
   sessions: SessionRow[];
@@ -30,6 +35,7 @@ interface StoreState {
   /** Отправить ПРИРОСТ секунд текущей сессии. Одна сессия = одна строка на сервере. */
   syncTime: (sessionKey: string, deltaSeconds: number, final?: boolean) => Promise<boolean>;
   fetchLeaderboard: () => Promise<void>;
+  fetchWeekLeaderboard: () => Promise<void>;
   fetchStats: () => Promise<void>;
   fetchSessions: () => Promise<void>;
   deleteSession: (sessionId: string) => Promise<void>;
@@ -102,7 +108,7 @@ const AUTH_RE = /AUTH_REQUIRED/i;
 export const useStore = create<StoreState>()(
   persist(
     (set, get) => ({
-      user: null, token: null, squad: null, leaderboard: [], bans: [], stats: null, sessions: [],
+      user: null, token: null, squad: null, leaderboard: [], weekBoard: [], bans: [], stats: null, sessions: [],
       isLoading: false, isRefreshing: false, error: null, syncError: null, lastSyncAt: null,
 
       registerByUsername: async (username, name, password) => {
@@ -186,7 +192,7 @@ export const useStore = create<StoreState>()(
           const { error } = await withTimeout(supabase.rpc('leave_squad', { p_token: token }));
           if (error) throw new Error(error.message);
         } catch (e) { set({ error: friendlyNetworkError(e) }); return; }
-        set({ squad: null, user: { ...user, squad_id: null }, leaderboard: [], bans: [] });
+        set({ squad: null, user: { ...user, squad_id: null }, leaderboard: [], weekBoard: [], bans: [] });
       },
 
       // ГЛАВНОЕ: чанки каждые 5 минут ОБНОВЛЯЮТ одну сессию на сервере.
@@ -243,13 +249,30 @@ export const useStore = create<StoreState>()(
           if (error) throw new Error(error.message);
           const cleanData: LeaderboardEntry[] = (data ?? []).map((i: any) => ({ ...i, total_seconds: num(i.total_seconds) }));
           if (!cleanData.some((e) => e.id === user.id)) {
-            set({ squad: null, user: { ...user, squad_id: null }, leaderboard: [], bans: [], isRefreshing: false });
+            set({ squad: null, user: { ...user, squad_id: null }, leaderboard: [], weekBoard: [], bans: [], isRefreshing: false });
             return;
           }
           set({ leaderboard: cleanData, isRefreshing: false, lastSyncAt: Date.now() });
         } catch (e) {
           set({ isRefreshing: false, syncError: friendlyNetworkError(e) });
         }
+      }),
+
+      fetchWeekLeaderboard: () => dedupe('weekBoard', async () => {
+        const { user, token } = get();
+        if (!user?.squad_id || !token) { set({ weekBoard: [] }); return; }
+        try {
+          const { data, error } = await retryResult(() =>
+            supabase.rpc('get_squad_week_leaderboard', { p_token: token }),
+          );
+          if (error) throw new Error(error.message);
+          set({ weekBoard: (data ?? []).map((i: any): WeekLeaderboardEntry => ({
+            ...i,
+            week_seconds: num(i.week_seconds), today_seconds: num(i.today_seconds),
+            active_days: num(i.active_days), sessions_count: num(i.sessions_count),
+            focus_score: num(i.focus_score),
+          })) });
+        } catch (e) { set({ syncError: friendlyNetworkError(e) }); }
       }),
 
       fetchStats: () => dedupe('stats', async () => {
@@ -283,7 +306,7 @@ export const useStore = create<StoreState>()(
         try {
           const { error } = await withTimeout(supabase.rpc('ban_squad_member', { p_token: token, p_target_id: targetId }));
           if (error) throw new Error(error.message);
-          await Promise.all([get().fetchLeaderboard(), get().fetchBans()]);
+          await Promise.all([get().fetchLeaderboard(), get().fetchWeekLeaderboard(), get().fetchBans()]);
         } catch (e) { set({ error: friendlyNetworkError(e) }); }
       },
 
@@ -324,7 +347,7 @@ export const useStore = create<StoreState>()(
         const { token } = get();
         if (token) { try { supabase.rpc('logout_user', { p_token: token }); } catch {} }
         set({
-          user: null, token: null, squad: null, leaderboard: [], bans: [], stats: null, sessions: [],
+          user: null, token: null, squad: null, leaderboard: [], weekBoard: [], bans: [], stats: null, sessions: [],
           error: null, syncError: null, lastSyncAt: null,
         });
       },
