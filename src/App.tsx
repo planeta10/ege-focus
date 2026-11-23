@@ -30,12 +30,11 @@ const pageVariants = {
 
 type View = 'timer' | 'leaderboard' | 'stats';
 const AUTOSAVE_EVERY = 300;
-const POLL_MS = 30_000;
+const POLL_MS = 20_000;
 const HEARTBEAT_MS = 15_000;
 
 type TabItem = { id: View; icon: typeof Clock; label: string };
 
-// Таб-бар с «жидкой» плашкой (без изменений)
 function TabBar({ tabs, view, onChange }: { tabs: TabItem[]; view: View; onChange: (v: View) => void }) {
   const navRef = useRef<HTMLElement>(null);
   const btnRefs = useRef<Record<string, HTMLButtonElement | null>>({});
@@ -121,9 +120,13 @@ export default function App() {
 
   useEffect(() => T.subscribe(setSnap), []);
 
+  // Каждую секунду фиксируем ПОЛНОЕ время сессии в localStorage.
+  // Перезагрузка восстанавливает тот же total — задвоения нет.
   useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), 250);
-    const wake = () => setNow(Date.now());
+    const beat = () => { T.tick(); setNow(Date.now()); };
+    beat();
+    const id = window.setInterval(beat, 1000);
+    const wake = () => beat();
     document.addEventListener('visibilitychange', wake);
     window.addEventListener('focus', wake);
     return () => {
@@ -170,18 +173,20 @@ export default function App() {
     return () => clearInterval(id);
   }, [user?.squad_id, broadcast]);
 
-  // Чанк: СНАЧАЛА в localStorage, потом на сервер. Ключ — ключ СЕССИИ (один на все чанки),
-  // поэтому сервер обновляет одну строку, а не создаёт новую сессию каждые 5 минут.
+  // Фиксируем АБСОЛЮТНЫЙ total до отправки — переживает перезагрузку.
   const commitAndSend = useCallback((final = false) => {
     if (!user) return null;
+    T.tick();
+    const before = T.getSnapshot();
+    const totalNow = T.elapsedSeconds(before);
+    if (before.sessionKey) queuePendingChunk(user.id, before.sessionKey, totalNow, final);
     const c = T.commitChunk(final);
     if (!c) return null;
-    queuePendingChunk(user.id, c.sessionKey, c.seconds, c.final);
-    syncTime(c.sessionKey, c.seconds, c.final);
+    // шлём ПОЛНЫЙ объём сессии — syncTime сам вычтет уже подтверждённое
+    syncTime(c.sessionKey, totalNow, c.final);
     return c;
   }, [user?.id, syncTime]);
 
-  // Автосохранение каждые 5 минут — это ОБНОВЛЕНИЕ текущей сессии, не новая сессия
   useEffect(() => {
     if (user && isRunning && seconds - committed >= AUTOSAVE_EVERY) commitAndSend(false);
   }, [seconds, committed, isRunning, user?.id]);
@@ -215,24 +220,26 @@ export default function App() {
     return () => { clearInterval(id); document.removeEventListener('visibilitychange', onVis); };
   }, [view, user?.id, user?.squad_id, isAdmin, fetchLeaderboard, fetchWeekLeaderboard, fetchBans, fetchStats, fetchSessions]);
 
-  // Уход со страницы: таймер не останавливаем, накопленное кладём в очередь
-  // и пробуем дослать keepalive-запросом (с токеном и ключом сессии).
+  // Уход со страницы: таймер не останавливаем, кладём абсолютный total в очередь
+  // и пробуем дослать keepalive-запросом.
   useEffect(() => {
     if (!user || !token) return;
     const flush = () => {
-      T.touchAlive(true);
-      const c = T.commitChunk(false);
-      if (c) queuePendingChunk(user.id, c.sessionKey, c.seconds, c.final);
+      T.tick();
+      const before = T.getSnapshot();
+      const totalNow = T.elapsedSeconds(before);
+      if (before.sessionKey) queuePendingChunk(user.id, before.sessionKey, totalNow, false);
+      T.commitChunk(false);
       if (!SUPABASE_URL || !SUPABASE_KEY) return;
       for (const p of getPendingFor(user.id)) {
+        const delta = Math.max(0, p.total - p.sent);
+        if (delta < 1 && !p.final) continue;
         fetch(`${SUPABASE_URL}/rest/v1/rpc/sync_study_time`, {
           method: 'POST',
           keepalive: true,
           headers: { 'Content-Type': 'application/json', apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
-          body: JSON.stringify({ p_token: token, p_session_key: p.sessionKey, p_delta_seconds: p.seconds, p_final: p.final }),
+          body: JSON.stringify({ p_token: token, p_session_key: p.sessionKey, p_delta_seconds: delta, p_final: p.final }),
         }).catch(() => {});
-        // из очереди НЕ удаляем: подтверждение придёт при следующем открытии,
-        // сервер идемпотентен по ключу сессии и режет повторы по времени — дублей не будет
       }
     };
     const onVis = () => { if (document.visibilityState === 'hidden') flush(); };
@@ -280,15 +287,9 @@ export default function App() {
 
   const focusingCount = liveBoard.filter(r => r.live).length;
 
-  // Суммарное время сквада: серверные данные + мои ещё не подтверждённые секунды
-  const squadToday = useMemo(
-    () => weekBoard.reduce((a, e) => a + e.today_seconds, 0) + unsynced,
-    [weekBoard, unsynced],
-  );
-  const squadWeek = useMemo(
-    () => weekBoard.reduce((a, e) => a + e.week_seconds, 0) + unsynced,
-    [weekBoard, unsynced],
-  );
+  // Суммарное время сквада (серверные данные)
+  const squadToday = useMemo(() => weekBoard.reduce((a, e) => a + e.today_seconds, 0), [weekBoard]);
+  const squadWeek = useMemo(() => weekBoard.reduce((a, e) => a + e.week_seconds, 0), [weekBoard]);
 
   // --- ЭКРАН ВХОДА / РЕГИСТРАЦИИ ---
   if (!user || !token) {
@@ -306,7 +307,6 @@ export default function App() {
             </p>
           </div>
 
-          {/* Переключатель Вход / Регистрация */}
           <div className="glass-inset rounded-full p-1 flex">
             {(['login', 'register'] as const).map(m => (
               <button key={m} onClick={() => { setAuthMode(m); }}
@@ -395,7 +395,6 @@ export default function App() {
   // --- ГЛАВНЫЙ ЭКРАН ---
   return (
     <div className="app-shell min-h-dvh text-white flex flex-col items-center p-4 sm:p-6 pb-32 selection:bg-indigo-100">
-      {/* Header */}
       <motion.header initial={{ y: -20, opacity: 0 }} animate={{ y: 0, opacity: 1 }} className="app-header w-full max-w-md flex justify-between items-center gap-3 pt-2 z-10">
         <div className="flex items-center gap-3 min-w-0">
           <div className={twMerge("w-10 h-10 shrink-0 rounded-full flex items-center justify-center text-sm font-bold text-stone-800 ring-1 ring-white/40", user.avatar_color)}>
@@ -419,7 +418,6 @@ export default function App() {
         </div>
       </motion.header>
 
-      {/* Squad Info Bar */}
       <div className="w-full max-w-md mt-4 mb-2 shrink-0">
         <div className="glass rounded-3xl p-4 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3 min-w-0">
@@ -466,7 +464,6 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Content */}
       <main className="app-main w-full max-w-md flex-1 flex flex-col">
         <AnimatePresence mode="wait">
           {view === 'timer' && (
