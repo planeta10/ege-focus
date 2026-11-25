@@ -32,8 +32,8 @@ interface StoreState {
   createSquad: (name: string) => Promise<void>;
   joinSquad: (code: string) => Promise<void>;
   leaveSquad: () => Promise<void>;
-  /** Передать ПОЛНОЕ время сессии. Серверу уходит только разница с подтверждённым. */
-  syncTime: (sessionKey: string, totalSeconds: number, final?: boolean) => Promise<boolean>;
+  /** Отправить ПРИРОСТ секунд текущей сессии. Одна сессия = одна строка на сервере. */
+  syncTime: (sessionKey: string, deltaSeconds: number, final?: boolean) => Promise<boolean>;
   fetchLeaderboard: () => Promise<void>;
   fetchWeekLeaderboard: () => Promise<void>;
   fetchStats: () => Promise<void>;
@@ -43,6 +43,7 @@ interface StoreState {
   banMember: (targetId: string) => Promise<void>;
   unbanMember: (targetId: string) => Promise<void>;
   signOut: () => void;
+  logoutEverywhere: () => Promise<void>;
 }
 
 const num = (v: unknown) => Number(v) || 0;
@@ -56,75 +57,71 @@ function dedupe(key: string, fn: () => Promise<void>): Promise<void> {
   return p;
 }
 
-// ---------- Очередь сессий: АБСОЛЮТНЫЙ total, а не сумма дельт ----------
-const PENDING_KEY = 'ege-focus-sessions-v4';
-type PendingItem = { userId: string; sessionKey: string; total: number; sent: number; final: boolean; at: number };
+// ---------- Очередь неотправленных чанков (переживает закрытие вкладки) ----------
+const PENDING_KEY = 'ege-focus-pending-v2';
+type PendingItem = { userId: string; sessionKey: string; seconds: number; final: boolean; at: number };
 
 function readPending(): PendingItem[] {
   try {
     const raw = localStorage.getItem(PENDING_KEY);
     const arr = raw ? JSON.parse(raw) : [];
     return (Array.isArray(arr) ? arr : []).filter(
-      (p) => p && typeof p.userId === 'string' && typeof p.sessionKey === 'string'
-        && Number(p.total) >= 0 && Number(p.sent) >= 0,
-    ).map((p) => ({
-      userId: p.userId, sessionKey: p.sessionKey,
-      total: Math.min(86400, Math.floor(Number(p.total) || 0)),
-      sent: Math.min(86400, Math.floor(Number(p.sent) || 0)),
-      final: !!p.final, at: Number(p.at) || Date.now(),
-    }));
+      (p) => p && typeof p.userId === 'string' && typeof p.sessionKey === 'string' && Number(p.seconds) >= 0,
+    );
   } catch { return []; }
 }
 function writePending(items: PendingItem[]) {
   try {
     if (items.length === 0) localStorage.removeItem(PENDING_KEY);
-    else localStorage.setItem(PENDING_KEY, JSON.stringify(items.slice(-200)));
+    else localStorage.setItem(PENDING_KEY, JSON.stringify(items.slice(-500)));
   } catch {}
 }
-
-/** Зафиксировать ПОЛНОЕ время сессии. Идемпотентно. */
-export function queuePendingChunk(userId: string, sessionKey: string, totalSeconds: number, final: boolean) {
+/** Кладём/дописываем чанк в очередь ДО отправки. Чанки одной сессии склеиваются. */
+export function queuePendingChunk(userId: string, sessionKey: string, seconds: number, final: boolean) {
   const items = readPending();
-  const total = Math.min(86400, Math.max(0, Math.floor(totalSeconds)));
-  const ex = items.find((p) => p.userId === userId && p.sessionKey === sessionKey);
-  if (ex) {
-    ex.total = Math.max(ex.total, total);
-    ex.final = ex.final || final;
-    ex.at = Date.now();
+  const existing = items.find((p) => p.userId === userId && p.sessionKey === sessionKey && !p.final);
+  if (existing) {
+    existing.seconds += Math.floor(seconds);
+    existing.final = existing.final || final;
+    existing.at = Date.now();
   } else {
-    items.push({ userId, sessionKey, total, sent: 0, final, at: Date.now() });
+    items.push({ userId, sessionKey, seconds: Math.floor(seconds), final, at: Date.now() });
   }
   writePending(items);
 }
 export function getPendingFor(userId: string): PendingItem[] {
   return readPending().filter((p) => p.userId === userId);
 }
+/** Сколько секунд лежит в очереди и ещё не подтверждено сервером. */
 export function pendingSecondsFor(userId: string): number {
-  return getPendingFor(userId).reduce((a, p) => a + Math.max(0, p.total - p.sent), 0);
+  return getPendingFor(userId).reduce((a, p) => a + p.seconds, 0);
 }
-function markSent(userId: string, sessionKey: string, sent: number, final: boolean) {
-  const items = readPending();
-  const ex = items.find((p) => p.userId === userId && p.sessionKey === sessionKey);
-  if (!ex) return;
-  ex.sent = Math.max(ex.sent, Math.min(ex.total, Math.floor(sent)));
-  if (final || ex.sent >= ex.total) {
-    writePending(items.filter((p) => !(p.userId === userId && p.sessionKey === sessionKey)));
-  } else {
-    writePending(items);
-  }
-}
-function dropSession(userId: string, sessionKey: string) {
+function removePending(userId: string, sessionKey: string) {
   writePending(readPending().filter((p) => !(p.userId === userId && p.sessionKey === sessionKey)));
 }
 
+// ---------- Токен сессии: sessionStorage, не localStorage ----------
+const TOKEN_KEY = 'ege-focus-token';
+function readToken(): string | null {
+  try { return sessionStorage.getItem(TOKEN_KEY); } catch { return null; }
+}
+function writeToken(t: string | null) {
+  try {
+    if (t) sessionStorage.setItem(TOKEN_KEY, t);
+    else sessionStorage.removeItem(TOKEN_KEY);
+  } catch {}
+}
+
+// Один ключ сессии не отправляется параллельно дважды
 const syncingKeys = new Set<string>();
 let lastSquadFetch = 0;
+
 const AUTH_RE = /AUTH_REQUIRED/i;
 
 export const useStore = create<StoreState>()(
   persist(
     (set, get) => ({
-      user: null, token: null, squad: null, leaderboard: [], weekBoard: [], bans: [], stats: null, sessions: [],
+      user: null, token: readToken(), squad: null, leaderboard: [], weekBoard: [], bans: [], stats: null, sessions: [],
       isLoading: false, isRefreshing: false, error: null, syncError: null, lastSyncAt: null,
 
       registerByUsername: async (username, name, password) => {
@@ -136,6 +133,7 @@ export const useStore = create<StoreState>()(
           );
           if (error) throw new Error(error.message);
           if (!data?.token || !data?.profile) throw new Error('Сервер не вернул профиль');
+          writeToken(data.token as string);
           set({ user: data.profile as Profile, token: data.token as string, squad: null, isLoading: false });
           get().fetchStats();
         } catch (e) {
@@ -154,6 +152,7 @@ export const useStore = create<StoreState>()(
           if (error) throw new Error(error.message);
           if (!data?.token || !data?.profile) throw new Error('Сервер не вернул профиль');
           const profile = data.profile as Profile;
+          writeToken(data.token as string);
           set({ user: profile, token: data.token as string, isLoading: false });
           if (profile.squad_id) get().fetchLeaderboard();
           get().fetchStats();
@@ -162,8 +161,8 @@ export const useStore = create<StoreState>()(
           const msg = friendlyNetworkError(e);
           set({
             isLoading: false,
-            error: /INVALID_LOGIN/i.test(msg) ? 'Неверный ник или пароль'
-              : /NO_PASSWORD/i.test(msg) ? 'У этого аккаунта ещё нет пароля — задай его на вкладке «Регистрация»'
+            error: /RATE_LIMITED/i.test(msg) ? 'Слишком много попыток входа. Подожди 15 минут.'
+              : /INVALID_LOGIN/i.test(msg) ? 'Неверный ник или пароль'
               : msg.replace(/^.*?:\s*/, ''),
           });
         }
@@ -211,28 +210,25 @@ export const useStore = create<StoreState>()(
         set({ squad: null, user: { ...user, squad_id: null }, leaderboard: [], weekBoard: [], bans: [] });
       },
 
-      // totalSeconds = ПОЛНОЕ время сессии. Шлём только разницу с уже отправленным.
-      syncTime: async (sessionKey, totalSeconds, final = false) => {
+      // Чанки каждые 5 минут ОБНОВЛЯЮТ одну сессию на сервере.
+      // Сервер режет время по реально прошедшим секундам и игнорит повторы.
+      syncTime: async (sessionKey, deltaSeconds, final = false) => {
         const { user, token } = get();
         if (!user || !token) return false;
-        const total = Math.min(86400, Math.max(0, Math.floor(totalSeconds)));
+        const delta = Math.floor(deltaSeconds);
+        if (delta < 1 && !final) return false;
         const lockKey = `${user.id}:${sessionKey}`;
         if (syncingKeys.has(lockKey)) return false;
         syncingKeys.add(lockKey);
-        queuePendingChunk(user.id, sessionKey, total, final);
-        const item = getPendingFor(user.id).find((p) => p.sessionKey === sessionKey);
-        const alreadySent = item?.sent ?? 0;
-        const delta = Math.max(0, total - alreadySent);
-        if (delta < 1 && !final) { syncingKeys.delete(lockKey); return true; }
+        queuePendingChunk(user.id, sessionKey, delta, final);
         try {
-          const { data, error } = await retryResult(() =>
+          const { error } = await retryResult(() =>
             supabase.rpc('sync_study_time', {
               p_token: token, p_session_key: sessionKey, p_delta_seconds: delta, p_final: final,
             }),
           );
           if (error) throw new Error(error.message ?? String(error));
-          const serverTotal = num((data as any)?.total);
-          markSent(user.id, sessionKey, Math.max(serverTotal, alreadySent + num((data as any)?.accepted)), final);
+          removePending(user.id, sessionKey);
           set({ syncError: null });
           get().fetchLeaderboard();
           get().fetchStats();
@@ -241,6 +237,8 @@ export const useStore = create<StoreState>()(
           const msg = friendlyNetworkError(e);
           if (AUTH_RE.test(msg)) {
             set({ syncError: 'Сессия входа истекла — войди заново, время сохранено на устройстве.' });
+          } else if (/TOO_MANY_SESSIONS/i.test(msg)) {
+            set({ syncError: 'Слишком много незавершённых сессий. Заверши текущую и попробуй снова.' });
           } else {
             set({ syncError: 'Время пока не отправилось — оно сохранено на устройстве и уйдёт автоматически.' });
           }
@@ -254,10 +252,14 @@ export const useStore = create<StoreState>()(
         const { user, token } = get();
         if (!user?.squad_id || !token) { set({ leaderboard: [] }); return; }
         set({ isRefreshing: true });
+        // Сквад обновляем через RPC: прямой доступ к таблицам закрыт RLS
         if (Date.now() - lastSquadFetch > 60_000) {
           lastSquadFetch = Date.now();
-          Promise.resolve(supabase.from('squads').select('*').eq('id', user.squad_id).single())
-            .then(({ data: sq }) => { if (sq) set({ squad: sq as Squad }); })
+          Promise.resolve(supabase.rpc('get_my_squad', { p_token: token }))
+            .then(({ data }) => {
+              const sq = Array.isArray(data) ? data[0] : data;
+              if (sq) set({ squad: sq as Squad });
+            })
             .catch(() => { lastSquadFetch = 0; });
         }
         try {
@@ -353,20 +355,26 @@ export const useStore = create<StoreState>()(
         const { user, token } = get();
         if (!user || !token) return;
         const prev = get().sessions;
-        const removed = prev.find((s) => s.id === sessionId);
         set({ sessions: prev.filter((s) => s.id !== sessionId) });
         try {
           const { error } = await withTimeout(supabase.rpc('delete_study_session', { p_token: token, p_session_id: sessionId }));
           if (error) throw new Error(error.message);
-          const ck = (removed as any)?.client_key;
-          if (ck) dropSession(user.id, ck);
-          await Promise.all([get().fetchSessions(), get().fetchStats(), get().fetchLeaderboard(), get().fetchWeekLeaderboard()]);
+          await Promise.all([get().fetchSessions(), get().fetchStats(), get().fetchLeaderboard()]);
         } catch (e) { set({ sessions: prev, syncError: friendlyNetworkError(e) }); }
+      },
+
+      logoutEverywhere: async () => {
+        const { token } = get();
+        if (token) {
+          try { await withTimeout(supabase.rpc('logout_all_devices', { p_token: token })); } catch {}
+        }
+        get().signOut();
       },
 
       signOut: () => {
         const { token } = get();
         if (token) { try { supabase.rpc('logout_user', { p_token: token }); } catch {} }
+        writeToken(null);
         set({
           user: null, token: null, squad: null, leaderboard: [], weekBoard: [], bans: [], stats: null, sessions: [],
           error: null, syncError: null, lastSyncAt: null,
@@ -375,11 +383,12 @@ export const useStore = create<StoreState>()(
     }),
     {
       name: 'ege-focus-storage-v2',
-      partialize: (s) => ({ user: s.user, token: s.token, squad: s.squad, leaderboard: s.leaderboard, weekBoard: s.weekBoard, stats: s.stats, sessions: s.sessions }),
+      partialize: (s) => ({ user: s.user, squad: s.squad, leaderboard: s.leaderboard, weekBoard: s.weekBoard, stats: s.stats, sessions: s.sessions }),
     },
   ),
 );
 
+// ---------- Автодосылка очереди ----------
 let flushing = false;
 export async function flushPendingChunks(): Promise<void> {
   if (flushing) return;
@@ -390,7 +399,7 @@ export async function flushPendingChunks(): Promise<void> {
   flushing = true;
   try {
     for (const p of mine) {
-      const ok = await syncTime(p.sessionKey, p.total, p.final);
+      const ok = await syncTime(p.sessionKey, p.seconds, p.final);
       if (!ok) break;
     }
   } finally { flushing = false; }

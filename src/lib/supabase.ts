@@ -6,8 +6,7 @@ export const SUPABASE_URL: string | undefined = env.VITE_SUPABASE_URL;
 export const SUPABASE_KEY: string | undefined = env.VITE_SUPABASE_ANON_KEY;
 export const isSupabaseConfigured = Boolean(SUPABASE_URL && SUPABASE_KEY);
 
-/** Читающие запросы обрываем быстро (15 с) и пробуем снова на новом соединении,
- *  записи (сохранение времени) ждём дольше (30 с), но тоже с повторами. */
+/** Чтения ждём до 30 с (Supabase может «просыпаться»), записи — тоже 30 с, с повторами. */
 export const READ_TIMEOUT_MS = 30_000;
 export const WRITE_TIMEOUT_MS = 30_000;
 export const REQUEST_TIMEOUT_MS = WRITE_TIMEOUT_MS;
@@ -92,9 +91,10 @@ export function waitForOnline(maxMs = 30_000): Promise<void> {
     window.addEventListener('online', onOnline, { once: true });
   });
 }
+
 /**
- * Повтор для supabase-запросов. supabase-js НЕ бросает исключение при обрыве сети, а возвращает { error },
- * поэтому обычный retry() ничего не ловил. Здесь повторяем и такие ответы (до 3 попыток: 0.7 с → 1.4 с).
+ * Повтор для supabase-запросов: supabase-js не бросает исключение при обрыве сети,
+ * а возвращает { error }, поэтому обычный retry() ничего не ловил.
  */
 export async function retryResult<T extends { error: any }>(
   fn: () => PromiseLike<T>,

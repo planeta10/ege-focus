@@ -100,7 +100,7 @@ export default function App() {
   const {
     user, token, squad, leaderboard, weekBoard, bans, stats, sessions, isLoading, isRefreshing, error, syncError, lastSyncAt,
     registerByUsername, loginByUsername, createSquad, joinSquad, leaveSquad, syncTime,
-    fetchLeaderboard, fetchWeekLeaderboard, fetchStats, fetchSessions, deleteSession, fetchBans, banMember, unbanMember, signOut
+    fetchLeaderboard, fetchWeekLeaderboard, fetchStats, fetchSessions, deleteSession, fetchBans, banMember, unbanMember, signOut, logoutEverywhere
   } = useStore();
 
   useLiquidGlass();
@@ -294,7 +294,7 @@ export default function App() {
   // --- ЭКРАН ВХОДА / РЕГИСТРАЦИИ ---
   if (!user || !token) {
     const canSubmit = authMode === 'register'
-      ? username.trim().length >= 3 && displayName.trim().length >= 1 && password.length >= 6
+      ? username.trim().length >= 3 && displayName.trim().length >= 1 && password.length >= 8
       : username.trim().length >= 3 && password.length >= 1;
     return (
       <div className="app-shell min-h-dvh flex items-center justify-center p-6">
@@ -329,7 +329,7 @@ export default function App() {
                 onChange={e => setPassword(e.target.value)}
                 onKeyDown={e => { if (e.key === 'Enter' && canSubmit && !isLoading) submitAuth(); }}
                 type={showPassword ? 'text' : 'password'}
-                placeholder={authMode === 'register' ? 'Пароль (минимум 6 символов)' : 'Пароль'}
+                placeholder={authMode === 'register' ? 'Пароль (минимум 8 символов)' : 'Пароль'}
                 autoComplete={authMode === 'register' ? 'new-password' : 'current-password'}
                 className="glass-input w-full pr-11"
               />
@@ -705,6 +705,20 @@ export default function App() {
                   ))}
                 </div>
               )}
+		              <div className="mt-8 glass-row p-4">
+                <h3 className="text-sm font-medium text-white/60 mb-2 flex items-center gap-2">
+                  <ShieldCheck size={16} className="text-emerald-300/80" /> Безопасность
+                </h3>
+                <p className="text-[11px] text-white/40 mb-3 leading-snug">
+                  Если подозреваешь, что кто-то получил доступ к аккаунту — выйди на всех устройствах. Все сессии входа будут сброшены.
+                </p>
+                <button
+                  onClick={() => { if (window.confirm('Выйти на всех устройствах? Потребуется войти заново.')) logoutEverywhere(); }}
+                  className="btn-danger w-full py-2.5 rounded-xl text-sm font-medium"
+                >
+                  Выйти на всех устройствах
+                </button>
+              </div>
             </motion.div>
           )}
         </AnimatePresence>
