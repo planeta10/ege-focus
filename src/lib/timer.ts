@@ -1,19 +1,22 @@
 // ЕДИНЫЙ источник правды о времени.
-// В localStorage — АБСОЛЮТНОЕ время сессии. На сервер — только разница с подтверждённым.
-// После каждого коммита startedAt = now, иначе reload задваивает время.
+//
+// ИНВАРИАНТЫ:
+// 1. totalSeconds монотонно растёт, никогда не уменьшается в рамках сессии.
+// 2. После КАЖДОГО capture startedAt = now, base = total — иначе reload задвоит время.
+// 3. capture возвращает АБСОЛЮТНЫЙ total (не прирост). Прирост считает стор.
+// 4. Финализация обнуляет таймер и ключ: следующий старт = новая сессия.
 
 export interface TimerSnapshot {
   sessionKey: string | null;
   isRunning: boolean;
   startedAt: number | null;
   baseSeconds: number;
-  committedSeconds: number;
   totalSeconds: number;
   updatedAt: number;
 }
 
-const KEY = 'ege-focus-timer-v3';
-const LEGACY_KEYS = ['ege-focus-timer-v2', 'ege-focus-timer-v1', 'ege-focus-timer'];
+const KEY = 'ege-focus-timer-v5';
+const LEGACY_KEYS = ['ege-focus-timer-v4', 'ege-focus-timer-v3', 'ege-focus-timer-v2'];
 const MAX_SESSION_SECONDS = 24 * 3600;
 
 type Listener = (s: TimerSnapshot) => void;
@@ -21,7 +24,7 @@ const listeners = new Set<Listener>();
 const nowMs = () => Date.now();
 
 function fresh(): TimerSnapshot {
-  return { sessionKey: null, isRunning: false, startedAt: null, baseSeconds: 0, committedSeconds: 0, totalSeconds: 0, updatedAt: nowMs() };
+  return { sessionKey: null, isRunning: false, startedAt: null, baseSeconds: 0, totalSeconds: 0, updatedAt: nowMs() };
 }
 
 let state: TimerSnapshot = fresh();
@@ -33,18 +36,19 @@ function persist(s: TimerSnapshot) {
 function emit() { listeners.forEach((l) => l({ ...state })); }
 function save(s: TimerSnapshot) { persist(s); emit(); }
 
+function clamp(v: unknown): number {
+  return Math.min(MAX_SESSION_SECONDS, Math.max(0, Math.floor(Number(v) || 0)));
+}
+
 function sanitize(p: any): TimerSnapshot {
   const s = fresh();
   s.sessionKey = typeof p.sessionKey === 'string' && p.sessionKey.length >= 8 ? p.sessionKey : null;
   s.isRunning = !!p.isRunning;
-  s.startedAt = typeof p.startedAt === 'number' && p.startedAt > 0 && p.startedAt <= nowMs() + 60_000 ? p.startedAt : null;
-  const clamp = (v: any) => Math.min(MAX_SESSION_SECONDS, Math.max(0, Math.floor(Number(v) || 0)));
+  s.startedAt = typeof p.startedAt === 'number' && p.startedAt > 0 && p.startedAt <= nowMs() + 60_000
+    ? p.startedAt : null;
   s.baseSeconds = clamp(p.baseSeconds ?? p.accumulated ?? p.seconds ?? 0);
-  s.committedSeconds = clamp(p.committedSeconds ?? 0);
-  s.totalSeconds = clamp(p.totalSeconds ?? 0);
-  s.totalSeconds = Math.max(s.totalSeconds, s.baseSeconds, s.committedSeconds);
+  s.totalSeconds = Math.max(clamp(p.totalSeconds ?? 0), s.baseSeconds);
   s.baseSeconds = Math.min(s.baseSeconds, s.totalSeconds);
-  s.committedSeconds = Math.min(s.committedSeconds, s.totalSeconds);
   if (s.isRunning && s.startedAt == null) s.isRunning = false;
   if (!s.isRunning) s.startedAt = null;
   s.updatedAt = Number(p.updatedAt) || nowMs();
@@ -79,7 +83,8 @@ export function elapsedSeconds(s: TimerSnapshot = state): number {
 }
 
 function newKey(): string {
-  const rnd = (globalThis.crypto?.randomUUID?.() ?? `${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`);
+  const rnd = globalThis.crypto?.randomUUID?.()
+    ?? `${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`;
   return `s-${nowMs().toString(36)}-${rnd}`.slice(0, 64);
 }
 
@@ -90,17 +95,6 @@ export function start(): void {
   s.baseSeconds = Math.max(s.baseSeconds, s.totalSeconds);
   s.isRunning = true;
   s.startedAt = nowMs();
-  s.updatedAt = nowMs();
-  save(s);
-}
-
-export function pause(): void {
-  const s = { ...state };
-  const total = elapsedSeconds(s);
-  s.baseSeconds = total;
-  s.totalSeconds = total;
-  s.isRunning = false;
-  s.startedAt = null;
   s.updatedAt = nowMs();
   save(s);
 }
@@ -122,35 +116,46 @@ export function tick(): void {
 export function touchAlive(_force = false): void { tick(); }
 export function reconcile(): void { tick(); }
 
-export interface Chunk { sessionKey: string; seconds: number; final: boolean; }
+export interface SessionState { sessionKey: string; total: number; final: boolean; }
 
-export function commitChunk(final = false): Chunk | null {
+/**
+ * Зафиксировать состояние сессии для отправки.
+ * Возвращает АБСОЛЮТНЫЙ total — стор сам вычтет уже подтверждённое.
+ */
+export function capture(final = false): SessionState | null {
   const s = { ...state };
   const total = elapsedSeconds(s);
-  const delta = total - s.committedSeconds;
-  if (!s.sessionKey) s.sessionKey = newKey();
-
-  if (delta < 1 && !final) {
-    persist({ ...s, totalSeconds: total, updatedAt: nowMs() });
-    return null;
+  if (!s.sessionKey) {
+    if (total < 1) return null;
+    s.sessionKey = newKey();
   }
-
   const key = s.sessionKey!;
-  const out = Math.max(0, delta);
-  s.committedSeconds = total;
-  s.baseSeconds = total;
-  s.totalSeconds = total;
-  s.updatedAt = nowMs();
 
   if (final) {
     persist(fresh());
     emit();
-    return { sessionKey: key, seconds: out, final: true };
+    return { sessionKey: key, total, final: true };
   }
-  // КРИТИЧНО: перезапускаем отрезок, иначе reload прибавит учтённое время повторно
+
+  // КРИТИЧНО: перезапускаем отрезок, иначе время посчитается дважды
+  s.totalSeconds = total;
+  s.baseSeconds = total;
   if (s.isRunning) s.startedAt = nowMs();
+  s.updatedAt = nowMs();
   save(s);
-  return { sessionKey: key, seconds: out, final: false };
+  return { sessionKey: key, total, final: false };
+}
+
+/** Остановить бег, ничего не отправляя (перед capture(true)). */
+export function halt(): void {
+  const s = { ...state };
+  const total = elapsedSeconds(s);
+  s.totalSeconds = total;
+  s.baseSeconds = total;
+  s.isRunning = false;
+  s.startedAt = null;
+  s.updatedAt = nowMs();
+  save(s);
 }
 
 export function discard(): void { save(fresh()); }

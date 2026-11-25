@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Play, Pause, Trophy, Clock, LogOut, Users, Plus, LogIn, Copy, XCircle, BarChart3, Ban, Crown, UserCheck, Trash2, Eye, EyeOff, ShieldCheck } from 'lucide-react';
-import { supabase, isSupabaseConfigured, SUPABASE_URL, SUPABASE_KEY } from './lib/supabase';
-import { useStore, flushPendingChunks, queuePendingChunk, getPendingFor, pendingSecondsFor } from './store/useStore';
+import { supabase, isSupabaseConfigured } from './lib/supabase';
+import { useStore, flushPendingChunks, queuePendingChunk, pendingSecondsFor, localTotalFor } from './store/useStore';
 import * as T from './lib/timer';
 import { connectLive, disconnectLive, publishMe, subscribeLive, liveSeconds, isFresh, finishedVisible, type LivePresence } from './lib/live';
 import { clsx } from 'clsx';
@@ -35,6 +35,7 @@ const HEARTBEAT_MS = 15_000;
 
 type TabItem = { id: View; icon: typeof Clock; label: string };
 
+// Таб-бар с «жидкой» плашкой
 function TabBar({ tabs, view, onChange }: { tabs: TabItem[]; view: View; onChange: (v: View) => void }) {
   const navRef = useRef<HTMLElement>(null);
   const btnRefs = useRef<Record<string, HTMLButtonElement | null>>({});
@@ -119,11 +120,26 @@ export default function App() {
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => T.subscribe(setSnap), []);
-
-  // Каждую секунду фиксируем ПОЛНОЕ время сессии в localStorage.
-  // Перезагрузка восстанавливает тот же total — задвоения нет.
+    // Вернулись на вкладку — сразу досылаем накопленное
   useEffect(() => {
-    const beat = () => { T.tick(); setNow(Date.now()); };
+    const onVisible = () => { if (document.visibilityState === 'visible') flushPendingChunks(); };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onVisible);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onVisible);
+    };
+  }, []);
+  // КАЖДУЮ СЕКУНДУ: полное время пишется в localStorage и в очередь сессий.
+  // Очередь хранит АБСОЛЮТНЫЙ total, поэтому повторная фиксация идемпотентна.
+  useEffect(() => {
+    const beat = () => {
+      T.tick();
+      const s = T.getSnapshot();
+      const uid = useStore.getState().user?.id;
+      if (uid && s.sessionKey) queuePendingChunk(uid, s.sessionKey, T.elapsedSeconds(s), false);
+      setNow(Date.now());
+    };
     beat();
     const id = window.setInterval(beat, 1000);
     const wake = () => beat();
@@ -139,8 +155,14 @@ export default function App() {
   const seconds = Math.floor(T.elapsedSeconds(snap));
   const isRunning = snap.isRunning;
   const isAdmin = !!(user && squad && squad.created_by === user.id);
-  const committed = snap.committedSeconds;
-  const unsynced = user ? Math.max(0, seconds - committed) + pendingSecondsFor(user.id) : 0;
+
+  // Единственный источник «неподтверждённого» времени — очередь (total - sent).
+  // Сложение с (seconds - committed) убрано: именно оно давало двойной счёт.
+  const unsynced = user ? pendingSecondsFor(user.id) : 0;
+  const localTotal = user ? localTotalFor(user.id) : 0;
+  const shownToday = (stats?.today_seconds ?? 0) + unsynced;
+  const shownTotal = Math.max(stats?.total_seconds ?? 0, localTotal) + unsynced;
+  const shownWeek = (stats?.week_seconds ?? 0) + unsynced;
 
   const [peers, setPeers] = useState<Record<string, LivePresence>>({});
   useEffect(() => subscribeLive(setPeers), []);
@@ -173,19 +195,21 @@ export default function App() {
     return () => clearInterval(id);
   }, [user?.squad_id, broadcast]);
 
-  // Фиксируем АБСОЛЮТНЫЙ total до отправки — переживает перезагрузку.
-    const commitAndSend = useCallback((final = false) => {
+  // Фиксируем АБСОЛЮТНЫЙ total сессии и отправляем. Стор сам вычтет подтверждённое.
+  const commitAndSend = useCallback((final = false) => {
     if (!user) return null;
-    const c = T.commitChunk(final);
-    if (!c) return null;
-    queuePendingChunk(user.id, c.sessionKey, c.seconds, c.final);
-    syncTime(c.sessionKey, c.seconds, c.final);
-    return c;
+    T.tick();
+    const st = T.capture(final);
+    if (!st) return null;
+    queuePendingChunk(user.id, st.sessionKey, st.total, st.final);
+    syncTime(st.sessionKey, st.total, st.final);
+    return st;
   }, [user?.id, syncTime]);
 
+  // Автосохранение раз в 5 минут: смотрим на неподтверждённый остаток в очереди
   useEffect(() => {
-    if (user && isRunning && seconds - committed >= AUTOSAVE_EVERY) commitAndSend(false);
-  }, [seconds, committed, isRunning, user?.id]);
+    if (user && isRunning && unsynced >= AUTOSAVE_EVERY) commitAndSend(false);
+  }, [unsynced, isRunning, user?.id]);
 
   useEffect(() => {
     T.touchAlive();
@@ -195,12 +219,24 @@ export default function App() {
     return () => { clearInterval(id); document.removeEventListener('visibilitychange', onVis); };
   }, []);
 
+    // Уход со страницы: только фиксируем абсолютное время локально.
+  // Отправкой займётся flushPendingChunks при возврате — он знает ответ сервера
+  // и не создаёт повторных чанков.
   useEffect(() => {
-    if (!user || !token) return;
-    flushPendingChunks();
-    if (user.squad_id) fetchLeaderboard();
-    fetchStats();
-  }, [user?.id, user?.squad_id, token]);
+    if (!user) return;
+    const persistOnly = () => {
+      T.tick();
+      const s = T.getSnapshot();
+      if (s.sessionKey) queuePendingChunk(user.id, s.sessionKey, T.elapsedSeconds(s), false);
+    };
+    const onVis = () => { if (document.visibilityState === 'hidden') persistOnly(); };
+    window.addEventListener('pagehide', persistOnly);
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      window.removeEventListener('pagehide', persistOnly);
+      document.removeEventListener('visibilitychange', onVis);
+    };
+  }, [user?.id]);
 
   useEffect(() => {
     if (!user) return;
@@ -216,42 +252,43 @@ export default function App() {
     return () => { clearInterval(id); document.removeEventListener('visibilitychange', onVis); };
   }, [view, user?.id, user?.squad_id, isAdmin, fetchLeaderboard, fetchWeekLeaderboard, fetchBans, fetchStats, fetchSessions]);
 
-  // Уход со страницы: таймер не останавливаем, кладём абсолютный total в очередь
-  // и пробуем дослать keepalive-запросом.
+      // Уход со страницы: только фиксируем абсолютное время локально, без сети.
+  // Отправкой займётся flushPendingChunks при возврате — он знает ответ сервера
+  // и не создаёт повторных чанков.
   useEffect(() => {
-    if (!user || !token) return;
-    const flush = () => {
+    if (!user) return;
+    const persistOnly = () => {
       T.tick();
-      const before = T.getSnapshot();
-      const totalNow = T.elapsedSeconds(before);
-      if (before.sessionKey) queuePendingChunk(user.id, before.sessionKey, totalNow, false);
-      T.commitChunk(false);
-      if (!SUPABASE_URL || !SUPABASE_KEY) return;
-            for (const p of getPendingFor(user.id)) {
-        if (p.seconds < 1 && !p.final) continue;
-        fetch(`${SUPABASE_URL}/rest/v1/rpc/sync_study_time`, {
-          method: 'POST',
-          keepalive: true,
-          headers: { 'Content-Type': 'application/json', apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
-          body: JSON.stringify({ p_token: token, p_session_key: p.sessionKey, p_delta_seconds: p.seconds, p_final: p.final }),
-        }).catch(() => {});
-        // из очереди НЕ удаляем: подтверждение придёт при следующем открытии,
-        // сервер идемпотентен по ключу сессии и режет повторы по времени
-      }
+      const s = T.getSnapshot();
+      if (s.sessionKey) queuePendingChunk(user.id, s.sessionKey, T.elapsedSeconds(s), false);
     };
-    const onVis = () => { if (document.visibilityState === 'hidden') flush(); };
-    window.addEventListener('pagehide', flush);
+    const onVis = () => { if (document.visibilityState === 'hidden') persistOnly(); };
+    window.addEventListener('pagehide', persistOnly);
     document.addEventListener('visibilitychange', onVis);
-    return () => { window.removeEventListener('pagehide', flush); document.removeEventListener('visibilitychange', onVis); };
-  }, [user?.id, token]);
+    return () => {
+      window.removeEventListener('pagehide', persistOnly);
+      document.removeEventListener('visibilitychange', onVis);
+    };
+  }, [user?.id]);
 
-    // Одна кнопка: старт / стоп. Остановка сохраняет сессию и обнуляет таймер.
+  // Вернулись на вкладку — сразу досылаем накопленное
+  useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === 'visible') flushPendingChunks(); };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onVisible);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onVisible);
+    };
+  }, []);
+
+  // Одна кнопка: старт / стоп. Остановка сохраняет сессию и обнуляет таймер.
   const handleToggle = () => {
     if (isRunning) {
       const total = Math.floor(T.elapsedSeconds());
-      T.pause();
-      const c = commitAndSend(true);   // final=true → сервер закрывает сессию, таймер сброшен
-      broadcast(c ? total : 0);
+      T.halt();
+      const st = commitAndSend(true);
+      broadcast(st ? total : 0);
     } else {
       T.start();
       broadcast();
@@ -304,6 +341,7 @@ export default function App() {
             </p>
           </div>
 
+          {/* Переключатель Вход / Регистрация */}
           <div className="glass-inset rounded-full p-1 flex">
             {(['login', 'register'] as const).map(m => (
               <button key={m} onClick={() => { setAuthMode(m); }}
@@ -392,6 +430,7 @@ export default function App() {
   // --- ГЛАВНЫЙ ЭКРАН ---
   return (
     <div className="app-shell min-h-dvh text-white flex flex-col items-center p-4 sm:p-6 pb-32 selection:bg-indigo-100">
+      {/* Header */}
       <motion.header initial={{ y: -20, opacity: 0 }} animate={{ y: 0, opacity: 1 }} className="app-header w-full max-w-md flex justify-between items-center gap-3 pt-2 z-10">
         <div className="flex items-center gap-3 min-w-0">
           <div className={twMerge("w-10 h-10 shrink-0 rounded-full flex items-center justify-center text-sm font-bold text-stone-800 ring-1 ring-white/40", user.avatar_color)}>
@@ -415,6 +454,7 @@ export default function App() {
         </div>
       </motion.header>
 
+      {/* Squad Info Bar */}
       <div className="w-full max-w-md mt-4 mb-2 shrink-0">
         <div className="glass rounded-3xl p-4 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3 min-w-0">
@@ -461,6 +501,7 @@ export default function App() {
         </div>
       )}
 
+      {/* Main Content */}
       <main className="app-main w-full max-w-md flex-1 flex flex-col">
         <AnimatePresence mode="wait">
           {view === 'timer' && (
@@ -469,8 +510,8 @@ export default function App() {
                 <motion.div animate={{ scale: isRunning ? [1, 1.02, 1] : 1 }} transition={{ repeat: Infinity, duration: 2 }} className={clsx("digits timer-digits", isRunning && 'digits-live')}>
                   {fmt(seconds)}
                 </motion.div>
-                                <p className="text-center text-white/45 mt-4 mb-8 text-sm">{isRunning ? 'Фокус активен' : 'Нажми старт'}</p>
-                                <div className="glass-inset rounded-full p-2 flex items-center justify-center">
+                <p className="text-center text-white/45 mt-4 mb-8 text-sm">{isRunning ? 'Фокус активен' : 'Нажми старт'}</p>
+                <div className="glass-inset rounded-full p-2 flex items-center justify-center">
                   <motion.button whileTap={{ scale: 0.92 }} onClick={handleToggle} className={clsx("p-8 rounded-full flex items-center justify-center", isRunning ? 'glass-raised' : 'btn-primary')} title={isRunning ? 'Стоп и сохранить' : 'Старт'}>
                     <AnimatePresence mode="wait">
                       <motion.div key={isRunning ? 'stop' : 'play'} initial={{ opacity: 0, scale: 0.5, rotate: -90 }} animate={{ opacity: 1, scale: 1, rotate: 0 }} exit={{ opacity: 0, scale: 0.5, rotate: 90 }} transition={{ duration: 0.2 }}>
@@ -662,13 +703,13 @@ export default function App() {
               <p className="text-xs text-white/45 px-1 mb-4">Не зависит от сквада: сохраняется, даже если ты выйдешь или сменишь сквад</p>
               <div className="glass rounded-3xl p-6 mb-3 text-center">
                 <p className="text-sm text-white/50 mb-2">Сегодня</p>
-                <p className="digits digits-live stats-digits">{fmt((stats?.today_seconds ?? 0) + unsynced)}</p>
+                <p className="digits digits-live stats-digits">{fmt(shownToday)}</p>
                 {isRunning && <p className="text-[11px] text-emerald-200/80 mt-2">+ текущая сессия в реальном времени</p>}
               </div>
               <div className="grid grid-cols-3 gap-2 sm:gap-3">
                 {[
-                  { label: 'За всё время', value: fmtShort((stats?.total_seconds ?? 0) + unsynced) },
-                  { label: '7 дней', value: fmtShort((stats?.week_seconds ?? 0) + unsynced) },
+                  { label: 'За всё время', value: fmtShort(shownTotal) },
+                  { label: '7 дней', value: fmtShort(shownWeek) },
                   { label: 'Сессий', value: String(stats?.sessions_count ?? 0) },
                 ].map(c => (
                   <div key={c.label} className="glass-row p-3 sm:p-4 text-center min-w-0">
@@ -701,7 +742,7 @@ export default function App() {
                   ))}
                 </div>
               )}
-		              <div className="mt-8 glass-row p-4">
+              <div className="mt-8 glass-row p-4">
                 <h3 className="text-sm font-medium text-white/60 mb-2 flex items-center gap-2">
                   <ShieldCheck size={16} className="text-emerald-300/80" /> Безопасность
                 </h3>
