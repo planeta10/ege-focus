@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { Play, Pause, RotateCcw, Trophy, Clock, LogOut, Users, Plus, LogIn, Copy, XCircle, BarChart3, Ban, Crown, UserCheck, Trash2, Eye, EyeOff, ShieldCheck } from 'lucide-react';
+import { Play, Pause, Trophy, Clock, LogOut, Users, Plus, LogIn, Copy, XCircle, BarChart3, Ban, Crown, UserCheck, Trash2, Eye, EyeOff, ShieldCheck } from 'lucide-react';
 import { supabase, isSupabaseConfigured, SUPABASE_URL, SUPABASE_KEY } from './lib/supabase';
 import { useStore, flushPendingChunks, queuePendingChunk, getPendingFor, pendingSecondsFor } from './store/useStore';
 import * as T from './lib/timer';
@@ -174,16 +174,12 @@ export default function App() {
   }, [user?.squad_id, broadcast]);
 
   // Фиксируем АБСОЛЮТНЫЙ total до отправки — переживает перезагрузку.
-  const commitAndSend = useCallback((final = false) => {
+    const commitAndSend = useCallback((final = false) => {
     if (!user) return null;
-    T.tick();
-    const before = T.getSnapshot();
-    const totalNow = T.elapsedSeconds(before);
-    if (before.sessionKey) queuePendingChunk(user.id, before.sessionKey, totalNow, final);
     const c = T.commitChunk(final);
     if (!c) return null;
-    // шлём ПОЛНЫЙ объём сессии — syncTime сам вычтет уже подтверждённое
-    syncTime(c.sessionKey, totalNow, c.final);
+    queuePendingChunk(user.id, c.sessionKey, c.seconds, c.final);
+    syncTime(c.sessionKey, c.seconds, c.final);
     return c;
   }, [user?.id, syncTime]);
 
@@ -231,15 +227,16 @@ export default function App() {
       if (before.sessionKey) queuePendingChunk(user.id, before.sessionKey, totalNow, false);
       T.commitChunk(false);
       if (!SUPABASE_URL || !SUPABASE_KEY) return;
-      for (const p of getPendingFor(user.id)) {
-        const delta = Math.max(0, p.total - p.sent);
-        if (delta < 1 && !p.final) continue;
+            for (const p of getPendingFor(user.id)) {
+        if (p.seconds < 1 && !p.final) continue;
         fetch(`${SUPABASE_URL}/rest/v1/rpc/sync_study_time`, {
           method: 'POST',
           keepalive: true,
           headers: { 'Content-Type': 'application/json', apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
-          body: JSON.stringify({ p_token: token, p_session_key: p.sessionKey, p_delta_seconds: delta, p_final: p.final }),
+          body: JSON.stringify({ p_token: token, p_session_key: p.sessionKey, p_delta_seconds: p.seconds, p_final: p.final }),
         }).catch(() => {});
+        // из очереди НЕ удаляем: подтверждение придёт при следующем открытии,
+        // сервер идемпотентен по ключу сессии и режет повторы по времени
       }
     };
     const onVis = () => { if (document.visibilityState === 'hidden') flush(); };
@@ -248,17 +245,17 @@ export default function App() {
     return () => { window.removeEventListener('pagehide', flush); document.removeEventListener('visibilitychange', onVis); };
   }, [user?.id, token]);
 
+    // Одна кнопка: старт / стоп. Остановка сохраняет сессию и обнуляет таймер.
   const handleToggle = () => {
-    if (isRunning) { T.pause(); commitAndSend(false); }
-    else T.start();
-    broadcast();
-  };
-
-  const handleStop = () => {
-    if (!user) return;
-    const total = Math.floor(T.elapsedSeconds());
-    const c = commitAndSend(true);
-    broadcast(c ? total : 0);
+    if (isRunning) {
+      const total = Math.floor(T.elapsedSeconds());
+      T.pause();
+      const c = commitAndSend(true);   // final=true → сервер закрывает сессию, таймер сброшен
+      broadcast(c ? total : 0);
+    } else {
+      T.start();
+      broadcast();
+    }
   };
 
   const submitAuth = () => {
@@ -472,13 +469,12 @@ export default function App() {
                 <motion.div animate={{ scale: isRunning ? [1, 1.02, 1] : 1 }} transition={{ repeat: Infinity, duration: 2 }} className={clsx("digits timer-digits", isRunning && 'digits-live')}>
                   {fmt(seconds)}
                 </motion.div>
-                <p className="text-center text-white/45 mt-4 mb-8 text-sm">{isRunning ? 'Фокус активен' : seconds > 0 ? 'Пауза' : 'Нажми старт'}</p>
-                <div className="glass-inset rounded-full p-2 flex items-center gap-3">
-                  <motion.button whileTap={{ scale: 0.9 }} onClick={handleStop} className="glass-raised p-4 rounded-full text-white/60 hover:!text-rose-300" title="Стоп и сохранить"><RotateCcw size={22} /></motion.button>
-                  <motion.button whileTap={{ scale: 0.92 }} onClick={handleToggle} className={clsx("p-7 rounded-full flex items-center justify-center", isRunning ? 'glass-raised' : 'btn-primary')} title={isRunning ? 'Пауза' : 'Старт'}>
+                                <p className="text-center text-white/45 mt-4 mb-8 text-sm">{isRunning ? 'Фокус активен' : 'Нажми старт'}</p>
+                                <div className="glass-inset rounded-full p-2 flex items-center justify-center">
+                  <motion.button whileTap={{ scale: 0.92 }} onClick={handleToggle} className={clsx("p-8 rounded-full flex items-center justify-center", isRunning ? 'glass-raised' : 'btn-primary')} title={isRunning ? 'Стоп и сохранить' : 'Старт'}>
                     <AnimatePresence mode="wait">
-                      <motion.div key={isRunning ? 'pause' : 'play'} initial={{ opacity: 0, scale: 0.5, rotate: -90 }} animate={{ opacity: 1, scale: 1, rotate: 0 }} exit={{ opacity: 0, scale: 0.5, rotate: 90 }} transition={{ duration: 0.2 }}>
-                        {isRunning ? <Pause size={30} fill="currentColor" /> : <Play size={30} fill="currentColor" className="ml-1" />}
+                      <motion.div key={isRunning ? 'stop' : 'play'} initial={{ opacity: 0, scale: 0.5, rotate: -90 }} animate={{ opacity: 1, scale: 1, rotate: 0 }} exit={{ opacity: 0, scale: 0.5, rotate: 90 }} transition={{ duration: 0.2 }}>
+                        {isRunning ? <Pause size={32} fill="currentColor" /> : <Play size={32} fill="currentColor" className="ml-1" />}
                       </motion.div>
                     </AnimatePresence>
                   </motion.button>
